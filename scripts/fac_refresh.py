@@ -7,7 +7,7 @@ Weekly incremental refresh from the FAC API (https://api.fac.gov).
 - Stores five core tables partitioned by audit year as gzipped CSVs
   (e.g. data/current/federal_awards_AY2025.csv.gz) to stay under
   GitHub's 100 MB file limit.
-- Writes data/current/delta_report.md summarizing new HUD/HHS-relevant
+- Writes data/current/delta_report.md summarizing new HHS-relevant
   filings with findings — the weekly "who just filed with a problem" alert.
 
 State: data/current/last_refresh.json stores the high-water fac_accepted_date.
@@ -42,7 +42,8 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "current"
 STATE_FILE = DATA_DIR / "last_refresh.json"
 PAGE_SIZE = 20000  # FAC hard cap per request
 
-HUD_HHS_PREFIXES = ("14", "93")
+# Target agency ALN prefixes. HHS = "93". (Add "14" to re-include HUD.)
+TARGET_PREFIXES = ("93",)
 
 
 def api_get(endpoint: str, params: dict) -> list:
@@ -109,7 +110,7 @@ def merge_csv(table: str, year: int, new_rows: list) -> int:
 
 
 def build_delta_report(new_general: list, new_findings: list, new_awards: list):
-    """Markdown alert: new/updated filings with HUD/HHS awards and findings."""
+    """Markdown alert: new/updated filings with HHS awards and findings."""
     lines = [f"# FAC Delta Report — {date.today().isoformat()}", ""]
     if not new_general:
         lines.append("No new or updated filings this week for the target audit years.")
@@ -121,18 +122,18 @@ def build_delta_report(new_general: list, new_findings: list, new_awards: list):
     awd = pd.DataFrame(new_awards) if new_awards else pd.DataFrame(columns=["report_id"])
 
     if not awd.empty and "federal_agency_prefix" in awd.columns:
-        hud_hhs_ids = set(
-            awd[awd["federal_agency_prefix"].astype(str).isin(HUD_HHS_PREFIXES)]["report_id"]
+        target_ids = set(
+            awd[awd["federal_agency_prefix"].astype(str).isin(TARGET_PREFIXES)]["report_id"]
         )
     else:
-        hud_hhs_ids = set()
+        target_ids = set()
 
     finding_counts = fin.groupby("report_id").size() if not fin.empty else pd.Series(dtype=int)
 
     lines.append(f"**New/updated filings:** {len(gen)}")
-    lines.append(f"**With HUD/HHS awards:** {len(hud_hhs_ids)}")
+    lines.append(f"**With HHS awards:** {len(target_ids)}")
     lines.append("")
-    lines.append("## Priority alerts: HUD/HHS filers with findings")
+    lines.append("## Priority alerts: HHS filers with findings")
     lines.append("")
     lines.append("| Auditee | State | Audit Year | Report ID | Findings | Fed. Expenditures |")
     lines.append("|---|---|---|---|---|---|")
@@ -141,7 +142,7 @@ def build_delta_report(new_general: list, new_findings: list, new_awards: list):
     for _, row in gen.iterrows():
         rid = row.get("report_id", "")
         n_findings = int(finding_counts.get(rid, 0))
-        if rid in hud_hhs_ids and n_findings > 0:
+        if rid in target_ids and n_findings > 0:
             alert_count += 1
             lines.append(
                 f"| {row.get('auditee_name','')} | {row.get('auditee_state','')} "
@@ -155,7 +156,7 @@ def build_delta_report(new_general: list, new_findings: list, new_awards: list):
     lines.append("_Next step: run the scoring pipeline against these report_ids and "
                  "compare against the existing Tier 1/Tier 2 workbook._")
     (DATA_DIR / "delta_report.md").write_text("\n".join(lines))
-    print(f"Delta report written: {alert_count} HUD/HHS finding alerts.")
+    print(f"Delta report written: {alert_count} HHS finding alerts.")
 
 
 def main():
