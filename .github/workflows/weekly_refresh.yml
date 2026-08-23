@@ -1,0 +1,53 @@
+name: Weekly FAC Refresh + Tier 1 Enrichment
+
+on:
+  schedule:
+    # Thursdays 10:00 UTC (6am ET) — FAC production API refreshes Wednesdays
+    - cron: "0 10 * * 4"
+  workflow_dispatch:
+    inputs:
+      full_backfill:
+        description: "Re-pull ALL records for target audit years (ignore last-refresh date)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas
+
+      - name: Pull FAC deltas
+        env:
+          FAC_API_KEY: ${{ secrets.FAC_API_KEY }}
+          FULL_BACKFILL: ${{ github.event.inputs.full_backfill }}
+        run: python scripts/fac_refresh.py
+
+      - name: Enrich Tier 1 (audit PDFs + 990s)
+        env:
+          FAC_API_KEY: ${{ secrets.FAC_API_KEY }}
+        run: python scripts/enrich_tier1.py
+
+      - name: Commit results
+        run: |
+          git config user.name "coa-automation"
+          git config user.email "actions@github.com"
+          git add data/ enrichment/
+          if git diff --cached --quiet; then
+            echo "No changes this week."
+          else
+            git commit -m "Weekly refresh $(date -u +%Y-%m-%d): FAC deltas + Tier 1 enrichment"
+            git push
+          fi
