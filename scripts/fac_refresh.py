@@ -4,7 +4,9 @@ Weekly incremental refresh from the FAC API (https://api.fac.gov).
 
 - Pulls records for TARGET_AUDIT_YEARS accepted since the last refresh
   (or everything for those years if FULL_BACKFILL=true).
-- Appends/updates five core tables stored as CSVs in data/current/.
+- Stores five core tables partitioned by audit year as gzipped CSVs
+  (e.g. data/current/federal_awards_AY2025.csv.gz) to stay under
+  GitHub's 100 MB file limit.
 - Writes data/current/delta_report.md summarizing new HUD/HHS-relevant
   filings with findings — the weekly "who just filed with a problem" alert.
 
@@ -82,23 +84,27 @@ def save_state():
     }, indent=2))
 
 
-def merge_csv(table: str, new_rows: list):
-    """Upsert new rows into the stored CSV, keyed on report_id (+ row identity)."""
+def merge_csv(table: str, year: int, new_rows: list) -> int:
+    """Upsert rows into the per-year gzipped CSV, keyed on report_id."""
     if not new_rows:
         return 0
-    new_df = pd.DataFrame(new_rows)
-    path = DATA_DIR / f"{table}.csv"
+    new_df = pd.DataFrame(new_rows).astype(str)
+    path = DATA_DIR / f"{table}_AY{year}.csv.gz"
     if path.exists():
         old_df = pd.read_csv(path, dtype=str, low_memory=False)
-        new_df = new_df.astype(str)
-        # Drop any prior rows for report_ids being refreshed (handles resubmissions),
-        # then append. This avoids duplicate findings rows for the same report.
+        # Drop prior rows for report_ids being refreshed (handles
+        # resubmissions), then append — avoids duplicate findings rows.
         refreshed_ids = set(new_df["report_id"].unique())
         old_df = old_df[~old_df["report_id"].isin(refreshed_ids)]
         merged = pd.concat([old_df, new_df], ignore_index=True)
     else:
-        merged = new_df.astype(str)
-    merged.to_csv(path, index=False)
+        merged = new_df
+    merged.to_csv(path, index=False, compression="gzip")
+    size_mb = path.stat().st_size / 1e6
+    print(f"    wrote {path.name}: {len(merged)} rows, {size_mb:.1f} MB compressed")
+    if size_mb > 90:
+        print(f"    WARNING: {path.name} approaching GitHub's 100 MB limit — "
+              "consider splitting further.")
     return len(new_df)
 
 
@@ -114,7 +120,6 @@ def build_delta_report(new_general: list, new_findings: list, new_awards: list):
     fin = pd.DataFrame(new_findings) if new_findings else pd.DataFrame(columns=["report_id"])
     awd = pd.DataFrame(new_awards) if new_awards else pd.DataFrame(columns=["report_id"])
 
-    # HUD/HHS flag from ALN prefix on awards
     if not awd.empty and "federal_agency_prefix" in awd.columns:
         hud_hhs_ids = set(
             awd[awd["federal_agency_prefix"].astype(str).isin(HUD_HHS_PREFIXES)]["report_id"]
@@ -155,36 +160,42 @@ def build_delta_report(new_general: list, new_findings: list, new_awards: list):
 
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # One-time cleanup: remove old uncompressed single-file versions if present
+    for table in TABLES:
+        legacy = DATA_DIR / f"{table}.csv"
+        if legacy.exists():
+            legacy.unlink()
+            print(f"Removed legacy file {legacy.name}")
+
     since = load_state()
     mode = f"incremental since {since}" if since else "FULL BACKFILL"
     print(f"FAC refresh — {mode}; audit years {TARGET_AUDIT_YEARS}")
 
-    all_new = {t: [] for t in TABLES}
+    delta_general, delta_findings, delta_awards = [], [], []
+
     for year in TARGET_AUDIT_YEARS:
-        # Step 1: which report_ids are new/updated? (general is the anchor table)
         params = {"audit_year": f"eq.{year}"}
         if since:
             params["fac_accepted_date"] = f"gte.{since}"
         gen_rows = api_get("general", params)
         print(f"  AY{year}: {len(gen_rows)} general records")
-        all_new["general"].extend(gen_rows)
+        delta_general.extend(gen_rows)
+        merge_csv("general", year, gen_rows)
 
-        # Step 2: pull child tables per year with the same acceptance filter where
-        # supported; otherwise filter to the report_ids we just found.
         rids = {r["report_id"] for r in gen_rows}
         if not rids:
             continue
         for table in TABLES[1:]:
             rows = api_get(table, dict(params))
             rows = [r for r in rows if r.get("report_id") in rids]
-            all_new[table].extend(rows)
-            print(f"    {table}: {len(rows)} rows")
+            merge_csv(table, year, rows)
+            if table == "findings":
+                delta_findings.extend(rows)
+            elif table == "federal_awards":
+                delta_awards.extend(rows)
 
-    for table in TABLES:
-        n = merge_csv(table, all_new[table])
-        print(f"  merged {n} rows into {table}.csv")
-
-    build_delta_report(all_new["general"], all_new["findings"], all_new["federal_awards"])
+    build_delta_report(delta_general, delta_findings, delta_awards)
     save_state()
     print("Refresh complete.")
 
